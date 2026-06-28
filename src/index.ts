@@ -33,9 +33,11 @@ manager.on("error", (err: Error) => {
 async function getOrCreateSession(sessionId?: string): Promise<string> {
   if (sessionId) {
     const entry = store.get(sessionId);
-    if (!entry) throw new Error(`Unknown session_id: ${sessionId}`);
-    // Persistent process keeps session state in memory — no session/resume needed
-    return entry.acpSessionId;
+    if (entry) return entry.acpSessionId;
+    // Not in store — try to restore from disk via session/load
+    await client.sessionLoad(sessionId, process.cwd());
+    store.set(sessionId, sessionId);
+    return sessionId;
   }
   const acpId = await client.sessionNew(process.cwd());
   store.set(acpId, acpId);
