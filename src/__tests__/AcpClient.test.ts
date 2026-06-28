@@ -401,6 +401,69 @@ describe("AcpClient pending request management", () => {
   });
 });
 
+// ── sessionLoad error handling ────────────────────────────────────────────────
+
+describe("AcpClient sessionLoad error handling", () => {
+  it("rejects with ACP error when session does not exist on disk", async () => {
+    const { client, fake } = makeClient();
+    const orig = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/load") {
+        fake.write = orig;
+        setImmediate(() =>
+          fake.injectMessage({
+            jsonrpc: "2.0",
+            id: req.id,
+            error: { code: -32602, message: "Session not found" },
+          }),
+        );
+      }
+    };
+
+    await expect(client.sessionLoad("nonexistent-uuid")).rejects.toThrow("Session not found");
+  });
+
+  it("does NOT enter replay mode when sessionLoad fails", async () => {
+    const { client, fake } = makeClient();
+    const orig = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/load") {
+        fake.write = orig;
+        setImmediate(() =>
+          fake.injectMessage({
+            jsonrpc: "2.0",
+            id: req.id,
+            error: { code: -32602, message: "Session not found" },
+          }),
+        );
+      }
+    };
+
+    await client.sessionLoad("nonexistent-uuid").catch(() => {});
+
+    // After failed load, a prompt to a different session works normally (no replay state left)
+    const orig2 = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig2(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/prompt") {
+        fake.write = orig2;
+        setImmediate(() => {
+          fake.injectMessage(makeTextUpdate("s-clean", "response"));
+          fake.injectMessage(makeTurnComplete("s-clean"));
+          fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
+        });
+      }
+    };
+    const result = await client.prompt("s-clean", "hello");
+    expect(result).toBe("response");
+  });
+});
+
 // ── session/load replay skip ──────────────────────────────────────────────────
 
 describe("AcpClient sessionLoad replay skip", () => {
