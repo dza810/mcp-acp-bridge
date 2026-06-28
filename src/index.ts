@@ -23,11 +23,10 @@ async function getOrCreateSession(sessionId?: string): Promise<string> {
   if (sessionId) {
     const entry = store.get(sessionId);
     if (!entry) throw new Error(`Unknown session_id: ${sessionId}`);
-    await client.sessionResume(entry.acpSessionId);
+    // Persistent process keeps session state in memory — no session/resume needed
     return entry.acpSessionId;
   }
-  const acpId = await client.sessionNew({ workspacePath: process.cwd() });
-  // Use the ACP session ID as the MCP session ID too (UUID passthrough)
+  const acpId = await client.sessionNew(process.cwd());
   store.set(acpId, acpId);
   return acpId;
 }
@@ -46,7 +45,7 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    const acpId = await client.sessionNew({ workspacePath: process.cwd() });
+    const acpId = await client.sessionNew(process.cwd());
     store.set(acpId, acpId);
     return {
       content: [{ type: "text" as const, text: JSON.stringify({ session_id: acpId }) }],
@@ -114,7 +113,13 @@ server.registerTool(
     const entry = store.get(session_id);
     if (!entry) throw new Error(`Unknown session_id: ${session_id}`);
 
-    await client.sessionDelete(entry.acpSessionId);
+    // session/delete is not implemented in all gemini-cli versions;
+    // remove from local store regardless.
+    try {
+      await client.sessionDelete(entry.acpSessionId);
+    } catch {
+      // best-effort — gemini-cli will GC sessions via its own retention policy
+    }
     store.delete(session_id);
     return {
       content: [{ type: "text" as const, text: JSON.stringify({ deleted: session_id }) }],

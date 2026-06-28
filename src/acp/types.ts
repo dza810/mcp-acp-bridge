@@ -50,16 +50,25 @@ export interface AgentCapabilities {
   auth?: { logout?: boolean };
 }
 
+export interface AuthMethod {
+  id: string;
+  name: string;
+  description?: string;
+  _meta?: unknown;
+}
+
 export interface InitializeResult {
   protocolVersion: number;
   agentInfo: { name: string; version: string };
   agentCapabilities: AgentCapabilities;
+  authMethods?: AuthMethod[];
 }
 
 // ── session/new ─────────────────────────────────────────────────────────────
 
 export interface SessionNewParams {
-  workspacePath?: string;
+  cwd: string;
+  mcpServers: unknown[];
 }
 
 export interface SessionNewResult {
@@ -74,13 +83,17 @@ export interface SessionResumeParams {
 
 // ── session/prompt ───────────────────────────────────────────────────────────
 
-export interface PromptPart {
+// ACP v1: prompt is an array of content blocks
+export interface TextContentBlock {
+  type: "text";
   text: string;
 }
 
+export type ContentBlock = TextContentBlock;
+
 export interface PromptParams {
   sessionId: string;
-  prompt: { parts: PromptPart[] };
+  prompt: ContentBlock[];
 }
 
 export interface PromptResult {
@@ -90,14 +103,28 @@ export interface PromptResult {
 
 // ── session/update (notification: agent → client) ───────────────────────────
 
+export type SessionUpdateKind =
+  | "agent_message_chunk"
+  | "agent_thought_chunk"
+  | "available_commands_update"
+  | "turn_complete"
+  | "error"
+  | string;
+
+export interface SessionUpdateContent {
+  type: "text" | string;
+  text?: string;
+}
+
+export interface SessionUpdatePayload {
+  sessionUpdate: SessionUpdateKind;
+  content?: SessionUpdateContent;
+  error?: string;
+}
+
 export interface SessionUpdateParams {
   sessionId: string;
-  turnId?: string;
-  type: "text" | "tool_call" | "tool_result" | "turn_complete" | "error";
-  text?: string;
-  toolCall?: unknown;
-  toolResult?: unknown;
-  error?: string;
+  update: SessionUpdatePayload;
 }
 
 // ── session/list ─────────────────────────────────────────────────────────────

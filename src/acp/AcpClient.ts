@@ -61,9 +61,21 @@ export class AcpClient extends EventEmitter {
     };
     const result = (await this.#request("initialize", params)) as InitializeResult;
     this.agentCapabilities = result.agentCapabilities ?? {};
+
+    // If the agent requires authentication and GEMINI_API_KEY is set, authenticate now.
+    if (result.authMethods && result.authMethods.length > 0) {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (apiKey) {
+        await this.#request("authenticate", {
+          methodId: "gemini-api-key",
+          _meta: { "api-key": { key: apiKey } },
+        });
+      }
+    }
   }
 
-  async sessionNew(params: SessionNewParams = {}): Promise<string> {
+  async sessionNew(cwd = process.cwd()): Promise<string> {
+    const params: SessionNewParams = { cwd, mcpServers: [] };
     const result = (await this.#request("session/new", params)) as SessionNewResult;
     return result.sessionId;
   }
@@ -87,7 +99,9 @@ export class AcpClient extends EventEmitter {
     await this.#request("session/close", params);
   }
 
-  // Send a prompt and collect all session/update text until turn_complete.
+  // Send a prompt and collect all session/update text.
+  // Resolves when EITHER the session/prompt JSON-RPC response arrives OR
+  // a turn_complete notification is received — whichever comes first.
   async prompt(sessionId: string, message: string): Promise<string> {
     this.updateBuffers.set(sessionId, []);
 
@@ -95,13 +109,19 @@ export class AcpClient extends EventEmitter {
       this.turnResolvers.set(sessionId, resolve);
     });
 
+    // ACP v1: prompt is an array of content blocks, not a {parts:[]} object
     const params: PromptParams = {
       sessionId,
-      prompt: { parts: [{ text: message }] },
+      prompt: [{ type: "text", text: message }],
     };
 
-    await this.#request("session/prompt", params);
-    await turnDone;
+    await Promise.race([
+      this.#request("session/prompt", params),
+      turnDone,
+    ]);
+
+    // Clean up in case the other signal arrives later
+    this.turnResolvers.delete(sessionId);
 
     const chunks = this.updateBuffers.get(sessionId) ?? [];
     this.updateBuffers.delete(sessionId);
@@ -151,18 +171,18 @@ export class AcpClient extends EventEmitter {
   }
 
   #onSessionUpdate(params: SessionUpdateParams): void {
-    const { sessionId, type, text } = params;
+    const { sessionId, update } = params;
+    const kind = update?.sessionUpdate;
 
-    if (type === "text" && text) {
+    if (kind === "agent_message_chunk" && update.content?.text) {
       const buf = this.updateBuffers.get(sessionId);
-      if (buf) buf.push(text);
+      if (buf) buf.push(update.content.text);
     }
 
-    if (type === "turn_complete" || type === "error") {
-      if (type === "error" && params.error) {
-        // Still resolve — caller gets whatever text was accumulated plus error note
+    if (kind === "turn_complete" || kind === "error") {
+      if (kind === "error" && update.error) {
         const buf = this.updateBuffers.get(sessionId);
-        if (buf) buf.push(`\n[error: ${params.error}]`);
+        if (buf) buf.push(`\n[error: ${update.error}]`);
       }
       const resolve = this.turnResolvers.get(sessionId);
       if (resolve) {
