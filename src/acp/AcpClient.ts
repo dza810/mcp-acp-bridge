@@ -40,6 +40,12 @@ export class AcpClient extends EventEmitter {
   private updateBuffers = new Map<string, string[]>();
   // Resolvers waiting for turn_complete per sessionId
   private turnResolvers = new Map<string, () => void>();
+  // Sessions in replay-skip mode (set by sessionLoad, cleared once new message boundary found)
+  private replayingSessions = new Set<string>();
+  // Accumulated user_message_chunk text per session during replay (for boundary detection)
+  private replayUserAccum = new Map<string, string>();
+  // The prompt text we're waiting to see in the stream to exit replay mode
+  private replayExpected = new Map<string, string>();
 
   constructor(manager: ProcessManager) {
     super();
@@ -61,9 +67,11 @@ export class AcpClient extends EventEmitter {
       pending.reject(err);
     }
     this.pending.clear();
-    // turnResolvers are associated with rejected prompt() calls — just GC them
     this.turnResolvers.clear();
     this.updateBuffers.clear();
+    this.replayingSessions.clear();
+    this.replayUserAccum.clear();
+    this.replayExpected.clear();
   }
 
   async initialize(): Promise<void> {
@@ -88,6 +96,14 @@ export class AcpClient extends EventEmitter {
         });
       }
     }
+  }
+
+  async sessionLoad(sessionId: string, cwd = process.cwd()): Promise<void> {
+    await this.#request("session/load", { sessionId, cwd, mcpServers: [] });
+    // Mark for replay-skip: subsequent prompt() will discard agent chunks until
+    // the user_message_chunk matching our new prompt appears in the stream.
+    this.replayingSessions.add(sessionId);
+    this.replayUserAccum.set(sessionId, "");
   }
 
   async sessionNew(cwd = process.cwd()): Promise<string> {
@@ -121,6 +137,12 @@ export class AcpClient extends EventEmitter {
   async prompt(sessionId: string, message: string): Promise<string> {
     this.updateBuffers.set(sessionId, []);
 
+    // If the session was loaded from disk, set up replay-skip boundary detection
+    if (this.replayingSessions.has(sessionId)) {
+      this.replayExpected.set(sessionId, message);
+      this.replayUserAccum.set(sessionId, "");
+    }
+
     const turnDone = new Promise<void>((resolve) => {
       this.turnResolvers.set(sessionId, resolve);
     });
@@ -138,6 +160,10 @@ export class AcpClient extends EventEmitter {
 
     // Clean up in case the other signal arrives later
     this.turnResolvers.delete(sessionId);
+    // Clear replay state (boundary may or may not have been found)
+    this.replayingSessions.delete(sessionId);
+    this.replayUserAccum.delete(sessionId);
+    this.replayExpected.delete(sessionId);
 
     const chunks = this.updateBuffers.get(sessionId) ?? [];
     this.updateBuffers.delete(sessionId);
@@ -190,6 +216,32 @@ export class AcpClient extends EventEmitter {
     const { sessionId, update } = params;
     const kind = update?.sessionUpdate;
 
+    // Replay-skip mode: discard everything until we see our new user message
+    if (this.replayingSessions.has(sessionId)) {
+      if (kind === "user_message_chunk" && update.content?.text) {
+        const accum = (this.replayUserAccum.get(sessionId) ?? "") + update.content.text;
+        this.replayUserAccum.set(sessionId, accum);
+        const expected = this.replayExpected.get(sessionId);
+        if (expected && accum.includes(expected)) {
+          // Found the boundary — switch to normal capture mode
+          this.replayingSessions.delete(sessionId);
+          this.replayUserAccum.delete(sessionId);
+          this.replayExpected.delete(sessionId);
+        }
+      } else if (kind === "turn_complete" || kind === "error") {
+        // Stream ended before finding the boundary (unexpected)
+        if (kind === "error" && update.error) {
+          const buf = this.updateBuffers.get(sessionId);
+          if (buf) buf.push(`\n[error: ${update.error}]`);
+        }
+        const resolve = this.turnResolvers.get(sessionId);
+        if (resolve) { this.turnResolvers.delete(sessionId); resolve(); }
+      }
+      // All other chunks (agent_message_chunk, agent_thought_chunk, tool_call…) are dropped
+      return;
+    }
+
+    // Normal capture mode
     if (kind === "agent_message_chunk" && update.content?.text) {
       const buf = this.updateBuffers.get(sessionId);
       if (buf) buf.push(update.content.text);

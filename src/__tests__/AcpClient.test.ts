@@ -401,6 +401,169 @@ describe("AcpClient pending request management", () => {
   });
 });
 
+// ── session/load replay skip ──────────────────────────────────────────────────
+
+describe("AcpClient sessionLoad replay skip", () => {
+  /** Respond to the next session/load request, then run cb() to inject prompt notifications. */
+  function setupLoad(
+    fake: FakeProcessManager,
+    sessionId: string,
+    newPromptText: string,
+    oldAgentChunks: string[],
+    newAgentChunks: string[],
+  ) {
+    const orig = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig(data);
+      const req = JSON.parse(data.trim());
+
+      if (req.method === "session/load") {
+        fake.write = orig;
+        // Respond to load, then set up prompt interceptor
+        setImmediate(() => {
+          fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: { modes: {}, models: {} } });
+          // Now intercept the upcoming session/prompt
+          const orig2 = fake.write.bind(fake);
+          fake.write = (data2: string) => {
+            orig2(data2);
+            const req2 = JSON.parse(data2.trim());
+            if (req2.method === "session/prompt") {
+              fake.write = orig2;
+              setImmediate(() => {
+                // Replay: old user chunk then old agent chunks
+                fake.injectMessage({
+                  jsonrpc: "2.0", method: "session/update",
+                  params: { sessionId, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "old user message" } } },
+                });
+                for (const text of oldAgentChunks) {
+                  fake.injectMessage({
+                    jsonrpc: "2.0", method: "session/update",
+                    params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } },
+                  });
+                }
+                // Boundary: our new user message appears
+                fake.injectMessage({
+                  jsonrpc: "2.0", method: "session/update",
+                  params: { sessionId, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: newPromptText } } },
+                });
+                // New agent response
+                for (const text of newAgentChunks) {
+                  fake.injectMessage(makeTextUpdate(sessionId, text));
+                }
+                fake.injectMessage(makeTurnComplete(sessionId));
+                fake.injectMessage({ jsonrpc: "2.0", id: req2.id, result: {} });
+              });
+            }
+          };
+        });
+      }
+    };
+  }
+
+  it("discards old agent chunks and returns only new response", async () => {
+    const { client, fake } = makeClient();
+    setupLoad(fake, "s-load", "new question", ["old answer 1", " old answer 2"], ["fresh"]);
+
+    await client.sessionLoad("s-load");
+    const result = await client.prompt("s-load", "new question");
+
+    expect(result).toBe("fresh");
+    expect(result).not.toContain("old");
+  });
+
+  it("works with multi-chunk user_message boundary (split across notifications)", async () => {
+    const { client, fake } = makeClient();
+    const orig = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/load") {
+        setImmediate(() => {
+          fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: { modes: {}, models: {} } });
+          fake.write = orig;
+          const orig2 = fake.write.bind(fake);
+          fake.write = (data2: string) => {
+            orig2(data2);
+            const req2 = JSON.parse(data2.trim());
+            if (req2.method === "session/prompt") {
+              fake.write = orig2;
+              setImmediate(() => {
+                // Replay old agent chunk
+                fake.injectMessage(makeTextUpdate("s-split", "stale"));
+                // Boundary arrives in TWO user_message_chunk pieces
+                fake.injectMessage({
+                  jsonrpc: "2.0", method: "session/update",
+                  params: { sessionId: "s-split", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "split" } } },
+                });
+                fake.injectMessage({
+                  jsonrpc: "2.0", method: "session/update",
+                  params: { sessionId: "s-split", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: " prompt" } } },
+                });
+                // New response
+                fake.injectMessage(makeTextUpdate("s-split", "new answer"));
+                fake.injectMessage(makeTurnComplete("s-split"));
+                fake.injectMessage({ jsonrpc: "2.0", id: req2.id, result: {} });
+              });
+            }
+          };
+        });
+      }
+    };
+
+    await client.sessionLoad("s-split");
+    const result = await client.prompt("s-split", "split prompt");
+
+    expect(result).toBe("new answer");
+    expect(result).not.toContain("stale");
+  });
+
+  it("normal session (no load) captures all chunks without replay skip", async () => {
+    const { client, fake } = makeClient();
+    // Directly go to prompt — no sessionLoad
+    const orig = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/prompt") {
+        fake.write = orig;
+        setImmediate(() => {
+          fake.injectMessage(makeTextUpdate("s-normal", "part1"));
+          fake.injectMessage(makeTextUpdate("s-normal", " part2"));
+          fake.injectMessage(makeTurnComplete("s-normal"));
+          fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
+        });
+      }
+    };
+    const result = await client.prompt("s-normal", "hi");
+    expect(result).toBe("part1 part2");
+  });
+
+  it("second prompt after loaded session is no longer in replay mode", async () => {
+    const { client, fake } = makeClient();
+    setupLoad(fake, "s-second", "first question", ["old"], ["first answer"]);
+
+    await client.sessionLoad("s-second");
+    await client.prompt("s-second", "first question"); // consumes replay mode
+
+    // Second prompt — no replay mode, all chunks captured
+    const orig = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/prompt") {
+        fake.write = orig;
+        setImmediate(() => {
+          fake.injectMessage(makeTextUpdate("s-second", "second answer"));
+          fake.injectMessage(makeTurnComplete("s-second"));
+          fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
+        });
+      }
+    };
+    const result = await client.prompt("s-second", "follow-up");
+    expect(result).toBe("second answer");
+  });
+});
+
 // ── process exit / drain ──────────────────────────────────────────────────────
 
 describe("AcpClient process exit handling", () => {
