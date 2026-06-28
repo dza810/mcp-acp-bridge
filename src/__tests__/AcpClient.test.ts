@@ -67,6 +67,35 @@ function autoRespond(fake: FakeProcessManager, result: object): void {
   };
 }
 
+// ── session/update wire-format helpers ───────────────────────────────────────
+
+function makeTextUpdate(sessionId: string, text: string) {
+  return {
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    },
+  };
+}
+
+function makeTurnComplete(sessionId: string) {
+  return {
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: { sessionId, update: { sessionUpdate: "turn_complete" } },
+  };
+}
+
+function makeErrorUpdate(sessionId: string, error: string) {
+  return {
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: { sessionId, update: { sessionUpdate: "error", error } },
+  };
+}
+
 // ── dispatch tests ────────────────────────────────────────────────────────────
 
 describe("AcpClient#onMessage dispatch", () => {
@@ -162,26 +191,10 @@ describe("AcpClient#prompt buffering", () => {
         fake.write = orig;
         // Inject updates then turn_complete, then the prompt response
         setImmediate(() => {
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: acpSessionId, type: "text", text: "Hello" },
-          });
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: acpSessionId, type: "text", text: ", world" },
-          });
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: acpSessionId, type: "turn_complete" },
-          });
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            id: req.id,
-            result: {},
-          });
+          fake.injectMessage(makeTextUpdate(acpSessionId, "Hello"));
+          fake.injectMessage(makeTextUpdate(acpSessionId, ", world"));
+          fake.injectMessage(makeTurnComplete(acpSessionId));
+          fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
         });
       }
     };
@@ -203,11 +216,7 @@ describe("AcpClient#prompt buffering", () => {
       if (req.method === "session/prompt") {
         fake.write = orig;
         setImmediate(() => {
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: "s1", type: "turn_complete" },
-          });
+          fake.injectMessage(makeTurnComplete("s1"));
           fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
         });
       }
@@ -225,16 +234,8 @@ describe("AcpClient#prompt buffering", () => {
       if (req.method === "session/prompt") {
         fake.write = orig;
         setImmediate(() => {
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: "s2", type: "text", text: "Partial" },
-          });
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: "s2", type: "error", error: "context limit" },
-          });
+          fake.injectMessage(makeTextUpdate("s2", "Partial"));
+          fake.injectMessage(makeErrorUpdate("s2", "context limit"));
           fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
         });
       }
@@ -255,16 +256,8 @@ describe("AcpClient#prompt buffering", () => {
         fake.write = orig;
         setImmediate(() => {
           // turn_complete BEFORE the response
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: "s3", type: "text", text: "early" },
-          });
-          fake.injectMessage({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: { sessionId: "s3", type: "turn_complete" },
-          });
+          fake.injectMessage(makeTextUpdate("s3", "early"));
+          fake.injectMessage(makeTurnComplete("s3"));
           fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
         });
       }
@@ -295,12 +288,12 @@ describe("AcpClient concurrent sessions", () => {
           fake.write = orig;
           setImmediate(() => {
             // Interleave updates from both sessions
-            fake.injectMessage({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sA", type: "text", text: "A1" } });
-            fake.injectMessage({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sB", type: "text", text: "B1" } });
-            fake.injectMessage({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sA", type: "text", text: "A2" } });
-            fake.injectMessage({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sB", type: "text", text: "B2" } });
-            fake.injectMessage({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sA", type: "turn_complete" } });
-            fake.injectMessage({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sB", type: "turn_complete" } });
+            fake.injectMessage(makeTextUpdate("sA", "A1"));
+            fake.injectMessage(makeTextUpdate("sB", "B1"));
+            fake.injectMessage(makeTextUpdate("sA", "A2"));
+            fake.injectMessage(makeTextUpdate("sB", "B2"));
+            fake.injectMessage(makeTurnComplete("sA"));
+            fake.injectMessage(makeTurnComplete("sB"));
             fake.injectMessage({ jsonrpc: "2.0", id: reqIdA, result: {} });
             fake.injectMessage({ jsonrpc: "2.0", id: reqIdB, result: {} });
           });
@@ -405,5 +398,86 @@ describe("AcpClient pending request management", () => {
     expect(r1.sessions[0].sessionId).toBe("a");
     expect(r2.sessions[0].sessionId).toBe("b");
     expect(r3.sessions[0].sessionId).toBe("c");
+  });
+});
+
+// ── process exit / drain ──────────────────────────────────────────────────────
+
+describe("AcpClient process exit handling", () => {
+  it("rejects all pending requests when process exits", async () => {
+    const { client, fake } = makeClient();
+
+    // Start a request without responding
+    const pending1 = client.sessionList();
+    const pending2 = client.sessionList();
+
+    // Simulate process exit
+    fake.emit("exit", { code: 1, signal: null });
+
+    await expect(pending1).rejects.toThrow(/exited/);
+    await expect(pending2).rejects.toThrow(/exited/);
+  });
+
+  it("prompt() rejects mid-flight when process exits", async () => {
+    const { client, fake } = makeClient();
+
+    // Start a prompt that will never get a response
+    const promptPromise = client.prompt("s1", "hello");
+
+    // Simulate process exit before any response
+    fake.emit("exit", { code: null, signal: "SIGKILL" });
+
+    await expect(promptPromise).rejects.toThrow(/exited/);
+  });
+
+  it("after process exit, a new request can still be sent (new process cycle)", async () => {
+    const { client, fake } = makeClient();
+
+    // Trigger exit to drain pending
+    fake.emit("exit", { code: 0, signal: null });
+
+    // New request sent to (simulated) new process — should still work
+    autoRespond(fake, { sessions: [{ sessionId: "new" }] });
+    const result = await client.sessionList();
+    expect(result.sessions[0].sessionId).toBe("new");
+  });
+
+  it("update buffer and turnResolvers are cleared on exit (no stale data in next prompt)", async () => {
+    const { client, fake } = makeClient();
+
+    // Start a prompt that injects one text chunk before the exit fires
+    const orig = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/prompt" && req.params?.sessionId === "s-stale") {
+        fake.write = orig;
+        setImmediate(() => {
+          fake.injectMessage(makeTextUpdate("s-stale", "stale-chunk"));
+          // NO turn_complete — process dies here
+          fake.emit("exit", { code: 1, signal: null });
+        });
+      }
+    };
+
+    const stalePromise = client.prompt("s-stale", "first").catch(() => {});
+    await stalePromise;
+
+    // Now send a second prompt to a different session — must NOT contain stale chunk
+    const orig2 = fake.write.bind(fake);
+    fake.write = (data: string) => {
+      orig2(data);
+      const req = JSON.parse(data.trim());
+      if (req.method === "session/prompt") {
+        fake.write = orig2;
+        setImmediate(() => {
+          fake.injectMessage(makeTextUpdate("s-fresh", "clean"));
+          fake.injectMessage(makeTurnComplete("s-fresh"));
+          fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
+        });
+      }
+    };
+    const result = await client.prompt("s-fresh", "second");
+    expect(result).toBe("clean");
   });
 });

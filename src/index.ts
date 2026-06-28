@@ -13,6 +13,17 @@ const store = new SessionStore();
 
 manager.on("restarting", ({ attempt, delayMs }: { attempt: number; delayMs: number }) => {
   process.stderr.write(`[mcp-gemini-cli] gemini restarting (attempt ${attempt}, delay ${delayMs}ms)\n`);
+  // Sessions tied to the dead process are invalid — clear them so callers get a clear error
+  store.clear();
+  // Re-initialize after the new process has had time to start (restart delay + startup buffer)
+  setTimeout(async () => {
+    try {
+      await client.initialize();
+      process.stderr.write("[mcp-gemini-cli] gemini re-initialized after restart\n");
+    } catch (e) {
+      process.stderr.write(`[mcp-gemini-cli] re-initialize failed after restart: ${e}\n`);
+    }
+  }, delayMs + 800);
 });
 
 manager.on("error", (err: Error) => {

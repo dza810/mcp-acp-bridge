@@ -48,6 +48,22 @@ export class AcpClient extends EventEmitter {
     this.manager.on("stderr", (text: string) => {
       process.stderr.write(`[gemini-cli] ${text}`);
     });
+    this.manager.on("exit", ({ code, signal }: { code: number | null; signal: string | null }) => {
+      this.#drainPending(
+        new Error(`gemini process exited (code=${code}, signal=${signal})`),
+      );
+    });
+  }
+
+  /** Reject all in-flight requests and clean up buffers (called on process exit). */
+  #drainPending(err: Error): void {
+    for (const pending of this.pending.values()) {
+      pending.reject(err);
+    }
+    this.pending.clear();
+    // turnResolvers are associated with rejected prompt() calls — just GC them
+    this.turnResolvers.clear();
+    this.updateBuffers.clear();
   }
 
   async initialize(): Promise<void> {

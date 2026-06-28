@@ -28,4 +28,8 @@ export class SessionStore {
       ...entry,
     }));
   }
+
+  clear(): void {
+    this.sessions.clear();
+  }
 }
