@@ -1,6 +1,6 @@
 {
   "name": "mcp-acp-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server that bridges MCP to ACP (Agent Client Protocol) supporting gemini-cli and opencode",
   "type": "module",
   "main": "dist/index.js",
