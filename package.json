@@ -1,9 +1,29 @@
 {
   "name": "mcp-acp-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server that bridges MCP to ACP (Agent Client Protocol) supporting gemini-cli and opencode",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "mcp-acp-bridge": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dza810/mcp-acp-bridge.git"
+  },
+  "keywords": [
+    "mcp",
+    "acp",
+    "agent-client-protocol",
+    "model-context-protocol",
+    "gemini",
+    "opencode",
+    "ai"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
