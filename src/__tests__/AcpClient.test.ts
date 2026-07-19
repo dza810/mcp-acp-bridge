@@ -1,26 +1,8 @@
-/**
- * AcpClient tests
- *
- * We avoid spawning real processes by injecting a FakeProcessManager —
- * an EventEmitter with a write() spy — instead of the real ProcessManager.
- *
- * Most bug-prone areas covered:
- *  1. #onMessage dispatch: response vs incoming-request vs notification
- *  2. session/update buffering and turn_complete / error resolution
- *  3. Concurrent sessions don't interfere with each other
- *  4. fs/read_text_file and fs/write_text_file callbacks
- *  5. session/request_permission auto-approve
- *  6. Pending request rejection on ACP error response
- *  7. Boundary: zero text updates before turn_complete
- *  8. Boundary: turn_complete arrives before session/prompt response
- */
-
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { AcpClient } from "../acp/AcpClient.js";
+import { GeminiProvider } from "../providers/GeminiProvider.js";
 import type { ProcessManager } from "../ProcessManager.js";
-
-// ── helpers ──────────────────────────────────────────────────────────────────
 
 class FakeProcessManager extends EventEmitter {
   written: string[] = [];
@@ -29,12 +11,10 @@ class FakeProcessManager extends EventEmitter {
     this.written.push(data);
   }
 
-  /** Push a raw JSON-RPC message as if it came from gemini stdout. */
   injectMessage(msg: object): void {
     this.emit("message", msg);
   }
 
-  /** Parse all written lines and return them as objects. */
   get writtenMessages(): object[] {
     return this.written.map((line) => JSON.parse(line.trim()));
   }
@@ -47,27 +27,23 @@ class FakeProcessManager extends EventEmitter {
 
 function makeClient(): { client: AcpClient; fake: FakeProcessManager } {
   const fake = new FakeProcessManager();
-  const client = new AcpClient(fake as unknown as ProcessManager);
+  const client = new AcpClient(fake as unknown as ProcessManager, new GeminiProvider());
   return { client, fake };
 }
 
-/** Simulate the server responding to the next outgoing request with a result. */
 function autoRespond(fake: FakeProcessManager, result: object): void {
-  // Watch for the next write, extract the id, and inject a response.
   const originalWrite = fake.write.bind(fake);
   fake.write = (data: string) => {
     originalWrite(data);
     const req = JSON.parse(data.trim());
     if ("id" in req && "method" in req) {
-      fake.write = originalWrite; // restore
+      fake.write = originalWrite;
       setImmediate(() =>
         fake.injectMessage({ jsonrpc: "2.0", id: req.id, result }),
       );
     }
   };
 }
-
-// ── session/update wire-format helpers ───────────────────────────────────────
 
 function makeTextUpdate(sessionId: string, text: string) {
   return {
@@ -95,8 +71,6 @@ function makeErrorUpdate(sessionId: string, error: string) {
     params: { sessionId, update: { sessionUpdate: "error", error } },
   };
 }
-
-// ── dispatch tests ────────────────────────────────────────────────────────────
 
 describe("AcpClient#onMessage dispatch", () => {
   it("routes message with id+result to response handler (resolves pending)", async () => {
@@ -127,27 +101,22 @@ describe("AcpClient#onMessage dispatch", () => {
 
   it("routes notification (no id, has method) to notification handler", () => {
     const { client, fake } = makeClient();
-    // No pending prompt — update should be silently buffered then dropped
     fake.injectMessage({
       jsonrpc: "2.0",
       method: "session/update",
       params: { sessionId: "s1", type: "text", text: "hello" },
     });
-    // No throw, no error emitted
   });
 
   it("routes incoming request (id + method) to incoming handler (fs/read_text_file)", async () => {
     const { client, fake } = makeClient();
-
-    // Inject an incoming fs/read request from the agent
     fake.injectMessage({
       jsonrpc: "2.0",
       id: 99,
       method: "fs/read_text_file",
-      params: { path: import.meta.filename }, // read this test file itself
+      params: { path: import.meta.filename },
     });
 
-    // fs.readFile is async — give it time to complete
     await new Promise((r) => setTimeout(r, 100));
 
     const response = fake.writtenMessages.find(
@@ -178,18 +147,14 @@ describe("AcpClient#onMessage dispatch", () => {
   });
 });
 
-// ── session/update buffering ──────────────────────────────────────────────────
-
 describe("AcpClient#prompt buffering", () => {
   function setupPromptSession(fake: FakeProcessManager, acpSessionId: string) {
-    // Intercept writes: answer session/prompt with a result, then inject updates
     const orig = fake.write.bind(fake);
     fake.write = (data: string) => {
       orig(data);
       const req = JSON.parse(data.trim());
       if (req.method === "session/prompt") {
         fake.write = orig;
-        // Inject updates then turn_complete, then the prompt response
         setImmediate(() => {
           fake.injectMessage(makeTextUpdate(acpSessionId, "Hello"));
           fake.injectMessage(makeTextUpdate(acpSessionId, ", world"));
@@ -246,7 +211,6 @@ describe("AcpClient#prompt buffering", () => {
   });
 
   it("turn_complete before session/prompt response still resolves correctly", async () => {
-    // turn_complete arrives first, then the JSON-RPC response
     const { client, fake } = makeClient();
     const orig = fake.write.bind(fake);
     fake.write = (data: string) => {
@@ -255,7 +219,6 @@ describe("AcpClient#prompt buffering", () => {
       if (req.method === "session/prompt") {
         fake.write = orig;
         setImmediate(() => {
-          // turn_complete BEFORE the response
           fake.injectMessage(makeTextUpdate("s3", "early"));
           fake.injectMessage(makeTurnComplete("s3"));
           fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: {} });
@@ -266,8 +229,6 @@ describe("AcpClient#prompt buffering", () => {
     expect(result).toBe("early");
   });
 });
-
-// ── concurrent sessions ───────────────────────────────────────────────────────
 
 describe("AcpClient concurrent sessions", () => {
   it("updates for different sessions do not interfere", async () => {
@@ -287,7 +248,6 @@ describe("AcpClient concurrent sessions", () => {
         if (reqIdA !== undefined && reqIdB !== undefined) {
           fake.write = orig;
           setImmediate(() => {
-            // Interleave updates from both sessions
             fake.injectMessage(makeTextUpdate("sA", "A1"));
             fake.injectMessage(makeTextUpdate("sB", "B1"));
             fake.injectMessage(makeTextUpdate("sA", "A2"));
@@ -311,18 +271,14 @@ describe("AcpClient concurrent sessions", () => {
   });
 });
 
-// ── fs/* callbacks ────────────────────────────────────────────────────────────
-
 describe("AcpClient fs callbacks", () => {
   it("fs/write_text_file writes a file then fs/read_text_file reads it back", async () => {
     const { client, fake } = makeClient();
     const tmpPath = `/tmp/acp-test-${Date.now()}.txt`;
 
-    // Write
     fake.injectMessage({ jsonrpc: "2.0", id: 1, method: "fs/write_text_file", params: { path: tmpPath, content: "hello test" } });
     await new Promise((r) => setTimeout(r, 100));
 
-    // Read
     fake.injectMessage({ jsonrpc: "2.0", id: 2, method: "fs/read_text_file", params: { path: tmpPath } });
     await new Promise((r) => setTimeout(r, 100));
 
@@ -340,8 +296,6 @@ describe("AcpClient fs callbacks", () => {
     expect(response.error.code).toBe(-32603);
   });
 });
-
-// ── session/request_permission ────────────────────────────────────────────────
 
 describe("AcpClient session/request_permission", () => {
   it("always responds with allow_once", async () => {
@@ -369,8 +323,6 @@ describe("AcpClient session/request_permission", () => {
   });
 });
 
-// ── pending request management ────────────────────────────────────────────────
-
 describe("AcpClient pending request management", () => {
   it("multiple in-flight requests resolve independently", async () => {
     const { client, fake } = makeClient();
@@ -383,12 +335,10 @@ describe("AcpClient pending request management", () => {
       if ("id" in req) capturedIds.push(req.id);
     };
 
-    // Fire 3 requests without responding yet
-    const p1 = client.sessionList();
-    const p2 = client.sessionList();
-    const p3 = client.sessionList();
+    const p1 = client.listSessions();
+    const p2 = client.listSessions();
+    const p3 = client.listSessions();
 
-    // Now respond in reverse order
     const [id1, id2, id3] = capturedIds;
     fake.injectMessage({ jsonrpc: "2.0", id: id3, result: { sessions: [{ sessionId: "c" }] } });
     fake.injectMessage({ jsonrpc: "2.0", id: id1, result: { sessions: [{ sessionId: "a" }] } });
@@ -400,8 +350,6 @@ describe("AcpClient pending request management", () => {
     expect(r3.sessions[0].sessionId).toBe("c");
   });
 });
-
-// ── sessionLoad error handling ────────────────────────────────────────────────
 
 describe("AcpClient sessionLoad error handling", () => {
   it("rejects with ACP error when session does not exist on disk", async () => {
@@ -422,7 +370,7 @@ describe("AcpClient sessionLoad error handling", () => {
       }
     };
 
-    await expect(client.sessionLoad("nonexistent-uuid")).rejects.toThrow("Session not found");
+    await expect(client.loadSession("nonexistent-uuid")).rejects.toThrow("Session not found");
   });
 
   it("does NOT enter replay mode when sessionLoad fails", async () => {
@@ -443,9 +391,8 @@ describe("AcpClient sessionLoad error handling", () => {
       }
     };
 
-    await client.sessionLoad("nonexistent-uuid").catch(() => {});
+    await client.loadSession("nonexistent-uuid").catch(() => {});
 
-    // After failed load, a prompt to a different session works normally (no replay state left)
     const orig2 = fake.write.bind(fake);
     fake.write = (data: string) => {
       orig2(data);
@@ -464,10 +411,7 @@ describe("AcpClient sessionLoad error handling", () => {
   });
 });
 
-// ── session/load replay skip ──────────────────────────────────────────────────
-
 describe("AcpClient sessionLoad replay skip", () => {
-  /** Respond to the next session/load request, then run cb() to inject prompt notifications. */
   function setupLoad(
     fake: FakeProcessManager,
     sessionId: string,
@@ -482,10 +426,8 @@ describe("AcpClient sessionLoad replay skip", () => {
 
       if (req.method === "session/load") {
         fake.write = orig;
-        // Respond to load, then set up prompt interceptor
         setImmediate(() => {
           fake.injectMessage({ jsonrpc: "2.0", id: req.id, result: { modes: {}, models: {} } });
-          // Now intercept the upcoming session/prompt
           const orig2 = fake.write.bind(fake);
           fake.write = (data2: string) => {
             orig2(data2);
@@ -493,7 +435,6 @@ describe("AcpClient sessionLoad replay skip", () => {
             if (req2.method === "session/prompt") {
               fake.write = orig2;
               setImmediate(() => {
-                // Replay: old user chunk then old agent chunks
                 fake.injectMessage({
                   jsonrpc: "2.0", method: "session/update",
                   params: { sessionId, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "old user message" } } },
@@ -504,12 +445,10 @@ describe("AcpClient sessionLoad replay skip", () => {
                     params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } },
                   });
                 }
-                // Boundary: our new user message appears
                 fake.injectMessage({
                   jsonrpc: "2.0", method: "session/update",
                   params: { sessionId, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: newPromptText } } },
                 });
-                // New agent response
                 for (const text of newAgentChunks) {
                   fake.injectMessage(makeTextUpdate(sessionId, text));
                 }
@@ -527,7 +466,7 @@ describe("AcpClient sessionLoad replay skip", () => {
     const { client, fake } = makeClient();
     setupLoad(fake, "s-load", "new question", ["old answer 1", " old answer 2"], ["fresh"]);
 
-    await client.sessionLoad("s-load");
+    await client.loadSession("s-load");
     const result = await client.prompt("s-load", "new question");
 
     expect(result).toBe("fresh");
@@ -551,9 +490,7 @@ describe("AcpClient sessionLoad replay skip", () => {
             if (req2.method === "session/prompt") {
               fake.write = orig2;
               setImmediate(() => {
-                // Replay old agent chunk
                 fake.injectMessage(makeTextUpdate("s-split", "stale"));
-                // Boundary arrives in TWO user_message_chunk pieces
                 fake.injectMessage({
                   jsonrpc: "2.0", method: "session/update",
                   params: { sessionId: "s-split", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "split" } } },
@@ -562,7 +499,6 @@ describe("AcpClient sessionLoad replay skip", () => {
                   jsonrpc: "2.0", method: "session/update",
                   params: { sessionId: "s-split", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: " prompt" } } },
                 });
-                // New response
                 fake.injectMessage(makeTextUpdate("s-split", "new answer"));
                 fake.injectMessage(makeTurnComplete("s-split"));
                 fake.injectMessage({ jsonrpc: "2.0", id: req2.id, result: {} });
@@ -573,7 +509,7 @@ describe("AcpClient sessionLoad replay skip", () => {
       }
     };
 
-    await client.sessionLoad("s-split");
+    await client.loadSession("s-split");
     const result = await client.prompt("s-split", "split prompt");
 
     expect(result).toBe("new answer");
@@ -582,7 +518,6 @@ describe("AcpClient sessionLoad replay skip", () => {
 
   it("normal session (no load) captures all chunks without replay skip", async () => {
     const { client, fake } = makeClient();
-    // Directly go to prompt — no sessionLoad
     const orig = fake.write.bind(fake);
     fake.write = (data: string) => {
       orig(data);
@@ -605,10 +540,9 @@ describe("AcpClient sessionLoad replay skip", () => {
     const { client, fake } = makeClient();
     setupLoad(fake, "s-second", "first question", ["old"], ["first answer"]);
 
-    await client.sessionLoad("s-second");
-    await client.prompt("s-second", "first question"); // consumes replay mode
+    await client.loadSession("s-second");
+    await client.prompt("s-second", "first question");
 
-    // Second prompt — no replay mode, all chunks captured
     const orig = fake.write.bind(fake);
     fake.write = (data: string) => {
       orig(data);
@@ -627,17 +561,13 @@ describe("AcpClient sessionLoad replay skip", () => {
   });
 });
 
-// ── process exit / drain ──────────────────────────────────────────────────────
-
 describe("AcpClient process exit handling", () => {
   it("rejects all pending requests when process exits", async () => {
     const { client, fake } = makeClient();
 
-    // Start a request without responding
-    const pending1 = client.sessionList();
-    const pending2 = client.sessionList();
+    const pending1 = client.listSessions();
+    const pending2 = client.listSessions();
 
-    // Simulate process exit
     fake.emit("exit", { code: 1, signal: null });
 
     await expect(pending1).rejects.toThrow(/exited/);
@@ -647,10 +577,8 @@ describe("AcpClient process exit handling", () => {
   it("prompt() rejects mid-flight when process exits", async () => {
     const { client, fake } = makeClient();
 
-    // Start a prompt that will never get a response
     const promptPromise = client.prompt("s1", "hello");
 
-    // Simulate process exit before any response
     fake.emit("exit", { code: null, signal: "SIGKILL" });
 
     await expect(promptPromise).rejects.toThrow(/exited/);
@@ -659,19 +587,16 @@ describe("AcpClient process exit handling", () => {
   it("after process exit, a new request can still be sent (new process cycle)", async () => {
     const { client, fake } = makeClient();
 
-    // Trigger exit to drain pending
     fake.emit("exit", { code: 0, signal: null });
 
-    // New request sent to (simulated) new process — should still work
     autoRespond(fake, { sessions: [{ sessionId: "new" }] });
-    const result = await client.sessionList();
+    const result = await client.listSessions();
     expect(result.sessions[0].sessionId).toBe("new");
   });
 
   it("update buffer and turnResolvers are cleared on exit (no stale data in next prompt)", async () => {
     const { client, fake } = makeClient();
 
-    // Start a prompt that injects one text chunk before the exit fires
     const orig = fake.write.bind(fake);
     fake.write = (data: string) => {
       orig(data);
@@ -680,7 +605,6 @@ describe("AcpClient process exit handling", () => {
         fake.write = orig;
         setImmediate(() => {
           fake.injectMessage(makeTextUpdate("s-stale", "stale-chunk"));
-          // NO turn_complete — process dies here
           fake.emit("exit", { code: 1, signal: null });
         });
       }
@@ -689,7 +613,6 @@ describe("AcpClient process exit handling", () => {
     const stalePromise = client.prompt("s-stale", "first").catch(() => {});
     await stalePromise;
 
-    // Now send a second prompt to a different session — must NOT contain stale chunk
     const orig2 = fake.write.bind(fake);
     fake.write = (data: string) => {
       orig2(data);

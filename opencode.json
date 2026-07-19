@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "mcp-acp-bridge": {
+      "type": "local",
+      "command": ["node", "/home/andrey/Documents/mcp-gemini-cli/dist/index.js"],
+      "enabled": true,
+      "environment": {
+        "DISABLE_GEMINI": "1"
+      }
+    }
+  }
+}

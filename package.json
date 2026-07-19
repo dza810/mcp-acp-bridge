@@ -1,7 +1,7 @@
 {
-  "name": "mcp-gemini-cli",
+  "name": "mcp-acp-bridge",
   "version": "0.1.0",
-  "description": "MCP server that bridges Claude Code to gemini-cli via ACP",
+  "description": "MCP server that bridges MCP to ACP (Agent Client Protocol) supporting gemini-cli and opencode",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

@@ -1,29 +1,16 @@
-import fs from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { ProcessManager } from "../ProcessManager.js";
+import type { AcpProvider, SessionContext } from "../providers/types.js";
 import type {
   JsonRpcMessage,
   JsonRpcRequest,
   JsonRpcResponse,
   JsonRpcNotification,
-  InitializeParams,
   InitializeResult,
   AgentCapabilities,
-  SessionNewParams,
-  SessionNewResult,
-  SessionResumeParams,
   SessionUpdateParams,
   SessionListResult,
-  SessionDeleteParams,
-  SessionCloseParams,
-  PromptParams,
-  RequestPermissionParams,
-  FsReadTextFileParams,
-  FsReadTextFileResult,
-  FsWriteTextFileParams,
 } from "./types.js";
-
-const PROTOCOL_VERSION = 1;
 
 interface PendingRequest {
   resolve: (result: unknown) => void;
@@ -32,36 +19,32 @@ interface PendingRequest {
 
 export class AcpClient extends EventEmitter {
   private readonly manager: ProcessManager;
+  private readonly provider: AcpProvider;
   private nextId = 1;
   private pending = new Map<string | number, PendingRequest>();
   private agentCapabilities: AgentCapabilities = {};
 
-  // Buffers text from session/update notifications keyed by sessionId
   private updateBuffers = new Map<string, string[]>();
-  // Resolvers waiting for turn_complete per sessionId
   private turnResolvers = new Map<string, () => void>();
-  // Sessions in replay-skip mode (set by sessionLoad, cleared once new message boundary found)
   private replayingSessions = new Set<string>();
-  // Accumulated user_message_chunk text per session during replay (for boundary detection)
   private replayUserAccum = new Map<string, string>();
-  // The prompt text we're waiting to see in the stream to exit replay mode
   private replayExpected = new Map<string, string>();
 
-  constructor(manager: ProcessManager) {
+  constructor(manager: ProcessManager, provider: AcpProvider) {
     super();
     this.manager = manager;
+    this.provider = provider;
     this.manager.on("message", (msg: JsonRpcMessage) => this.#onMessage(msg));
     this.manager.on("stderr", (text: string) => {
-      process.stderr.write(`[gemini-cli] ${text}`);
+      process.stderr.write(`[${provider.name}] ${text}`);
     });
     this.manager.on("exit", ({ code, signal }: { code: number | null; signal: string | null }) => {
       this.#drainPending(
-        new Error(`gemini process exited (code=${code}, signal=${signal})`),
+        new Error(`${provider.name} process exited (code=${code}, signal=${signal})`),
       );
     });
   }
 
-  /** Reject all in-flight requests and clean up buffers (called on process exit). */
   #drainPending(err: Error): void {
     for (const pending of this.pending.values()) {
       pending.reject(err);
@@ -75,69 +58,54 @@ export class AcpClient extends EventEmitter {
   }
 
   async initialize(): Promise<void> {
-    const params: InitializeParams = {
-      protocolVersion: PROTOCOL_VERSION,
-      clientInfo: { name: "mcp-gemini-cli", version: "0.1.0" },
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        terminal: false,
-      },
-    };
-    const result = (await this.#request("initialize", params)) as InitializeResult;
+    const params = this.provider.initializeParams();
+    const result = (await this.#request(
+      this.provider.methodName("initialize"),
+      params,
+    )) as InitializeResult;
     this.agentCapabilities = result.agentCapabilities ?? {};
 
-    // If the agent requires authentication and GEMINI_API_KEY is set, authenticate now.
     if (result.authMethods && result.authMethods.length > 0) {
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (apiKey) {
-        await this.#request("authenticate", {
-          methodId: "gemini-api-key",
-          _meta: { "api-key": { key: apiKey } },
-        });
-      }
+      const request = (method: string, p: unknown) => this.#request(method, p);
+      await this.provider.authenticate?.(request);
     }
   }
 
-  async sessionLoad(sessionId: string, cwd = process.cwd()): Promise<void> {
-    await this.#request("session/load", { sessionId, cwd, mcpServers: [] });
-    // Mark for replay-skip: subsequent prompt() will discard agent chunks until
-    // the user_message_chunk matching our new prompt appears in the stream.
+  async newSession(cwd = process.cwd()): Promise<string> {
+    const result = (await this.#request(
+      this.provider.methodName("new"),
+      { cwd, mcpServers: [] },
+    )) as { sessionId: string };
+    return result.sessionId;
+  }
+
+  async loadSession(sessionId: string, cwd = process.cwd()): Promise<void> {
+    await this.#request(
+      this.provider.methodName("load"),
+      { sessionId, cwd, mcpServers: [] },
+    );
     this.replayingSessions.add(sessionId);
     this.replayUserAccum.set(sessionId, "");
   }
 
-  async sessionNew(cwd = process.cwd()): Promise<string> {
-    const params: SessionNewParams = { cwd, mcpServers: [] };
-    const result = (await this.#request("session/new", params)) as SessionNewResult;
-    return result.sessionId;
+  async resumeSession(sessionId: string): Promise<void> {
+    await this.#request(
+      this.provider.methodName("resume"),
+      { sessionId },
+    );
   }
 
-  async sessionResume(sessionId: string): Promise<void> {
-    const params: SessionResumeParams = { sessionId };
-    await this.#request("session/resume", params);
+  async listSessions(): Promise<SessionListResult> {
+    const result = (await this.#request(
+      this.provider.methodName("list"),
+      {},
+    )) as any;
+    return { sessions: result.sessions ?? [] };
   }
 
-  async sessionList(): Promise<SessionListResult> {
-    return (await this.#request("session/list", {})) as SessionListResult;
-  }
-
-  async sessionDelete(sessionId: string): Promise<void> {
-    const params: SessionDeleteParams = { sessionId };
-    await this.#request("session/delete", params);
-  }
-
-  async sessionClose(sessionId: string): Promise<void> {
-    const params: SessionCloseParams = { sessionId };
-    await this.#request("session/close", params);
-  }
-
-  // Send a prompt and collect all session/update text.
-  // Resolves when EITHER the session/prompt JSON-RPC response arrives OR
-  // a turn_complete notification is received — whichever comes first.
   async prompt(sessionId: string, message: string): Promise<string> {
     this.updateBuffers.set(sessionId, []);
 
-    // If the session was loaded from disk, set up replay-skip boundary detection
     if (this.replayingSessions.has(sessionId)) {
       this.replayExpected.set(sessionId, message);
       this.replayUserAccum.set(sessionId, "");
@@ -147,20 +115,17 @@ export class AcpClient extends EventEmitter {
       this.turnResolvers.set(sessionId, resolve);
     });
 
-    // ACP v1: prompt is an array of content blocks, not a {parts:[]} object
-    const params: PromptParams = {
+    const params = {
       sessionId,
-      prompt: [{ type: "text", text: message }],
+      prompt: this.provider.formatPrompt(message),
     };
 
     await Promise.race([
-      this.#request("session/prompt", params),
+      this.#request(this.provider.methodName("prompt"), params),
       turnDone,
     ]);
 
-    // Clean up in case the other signal arrives later
     this.turnResolvers.delete(sessionId);
-    // Clear replay state (boundary may or may not have been found)
     this.replayingSessions.delete(sessionId);
     this.replayUserAccum.delete(sessionId);
     this.replayExpected.delete(sessionId);
@@ -170,8 +135,6 @@ export class AcpClient extends EventEmitter {
     return chunks.join("");
   }
 
-  // ── Incoming message dispatch ─────────────────────────────────────────────
-
   #onMessage(msg: JsonRpcMessage): void {
     const hasId = "id" in msg;
     const hasMethod = "method" in msg;
@@ -179,13 +142,10 @@ export class AcpClient extends EventEmitter {
     const hasError = "error" in msg;
 
     if (hasId && (hasResult || hasError)) {
-      // Response to one of our outgoing requests
       this.#handleResponse(msg as JsonRpcResponse);
     } else if (hasId && hasMethod) {
-      // Incoming request from agent (e.g. fs/read_text_file, session/request_permission)
       void this.#handleIncomingRequest(msg as JsonRpcRequest);
     } else {
-      // Notification from agent (no id, has method)
       this.#handleNotification(msg as JsonRpcNotification);
     }
   }
@@ -206,9 +166,6 @@ export class AcpClient extends EventEmitter {
       case "session/update":
         this.#onSessionUpdate(msg.params as SessionUpdateParams);
         break;
-      default:
-        // Unknown notification — ignore
-        break;
     }
   }
 
@@ -216,20 +173,17 @@ export class AcpClient extends EventEmitter {
     const { sessionId, update } = params;
     const kind = update?.sessionUpdate;
 
-    // Replay-skip mode: discard everything until we see our new user message
     if (this.replayingSessions.has(sessionId)) {
       if (kind === "user_message_chunk" && update.content?.text) {
         const accum = (this.replayUserAccum.get(sessionId) ?? "") + update.content.text;
         this.replayUserAccum.set(sessionId, accum);
         const expected = this.replayExpected.get(sessionId);
         if (expected && accum.includes(expected)) {
-          // Found the boundary — switch to normal capture mode
           this.replayingSessions.delete(sessionId);
           this.replayUserAccum.delete(sessionId);
           this.replayExpected.delete(sessionId);
         }
       } else if (kind === "turn_complete" || kind === "error") {
-        // Stream ended before finding the boundary (unexpected)
         if (kind === "error" && update.error) {
           const buf = this.updateBuffers.get(sessionId);
           if (buf) buf.push(`\n[error: ${update.error}]`);
@@ -237,62 +191,44 @@ export class AcpClient extends EventEmitter {
         const resolve = this.turnResolvers.get(sessionId);
         if (resolve) { this.turnResolvers.delete(sessionId); resolve(); }
       }
-      // All other chunks (agent_message_chunk, agent_thought_chunk, tool_call…) are dropped
       return;
     }
 
-    // Normal capture mode
-    if (kind === "agent_message_chunk" && update.content?.text) {
-      const buf = this.updateBuffers.get(sessionId);
-      if (buf) buf.push(update.content.text);
-    }
-
-    if (kind === "turn_complete" || kind === "error") {
-      if (kind === "error" && update.error) {
-        const buf = this.updateBuffers.get(sessionId);
-        if (buf) buf.push(`\n[error: ${update.error}]`);
-      }
-      const resolve = this.turnResolvers.get(sessionId);
-      if (resolve) {
-        this.turnResolvers.delete(sessionId);
-        resolve();
-      }
-    }
+    this.provider.handleSessionUpdate(params, this.#createContext(sessionId));
   }
 
-  // Handle requests that the agent sends to us (fs/*, session/request_permission)
+  #createContext(sessionId: string): SessionContext {
+    return {
+      sessionId,
+      bufferText: (text) => {
+        const buf = this.updateBuffers.get(sessionId);
+        if (buf) buf.push(text);
+      },
+      signalTurnDone: () => {
+        const resolve = this.turnResolvers.get(sessionId);
+        if (resolve) { this.turnResolvers.delete(sessionId); resolve(); }
+      },
+      signalError: (msg) => {
+        const buf = this.updateBuffers.get(sessionId);
+        if (buf) buf.push(`\n[error: ${msg}]`);
+        const resolve = this.turnResolvers.get(sessionId);
+        if (resolve) { this.turnResolvers.delete(sessionId); resolve(); }
+      },
+    };
+  }
+
   async #handleIncomingRequest(req: JsonRpcRequest): Promise<void> {
     try {
-      const result = await this.#dispatchIncoming(req.method, req.params);
-      this.#respond(req.id, result);
+      const result = await this.provider.handleIncomingRequest?.(req.method, req.params);
+      if (result !== undefined) {
+        this.#respond(req.id, result);
+      } else {
+        this.#respondError(req.id, -32603, `Unsupported incoming method: ${req.method}`);
+      }
     } catch (err) {
       this.#respondError(req.id, -32603, String(err));
     }
   }
-
-  async #dispatchIncoming(method: string, params: unknown): Promise<unknown> {
-    switch (method) {
-      case "fs/read_text_file": {
-        const { path } = params as FsReadTextFileParams;
-        const content = await fs.readFile(path, "utf8");
-        return { content } satisfies FsReadTextFileResult;
-      }
-      case "fs/write_text_file": {
-        const { path, content } = params as FsWriteTextFileParams;
-        await fs.writeFile(path, content, "utf8");
-        return {};
-      }
-      case "session/request_permission": {
-        // Auto-approve with allow_once
-        const p = params as RequestPermissionParams;
-        return { requestId: p.requestId, decision: "allow_once" };
-      }
-      default:
-        throw new Error(`Unsupported incoming method: ${method}`);
-    }
-  }
-
-  // ── JSON-RPC 2.0 helpers ──────────────────────────────────────────────────
 
   #request(method: string, params: unknown): Promise<unknown> {
     return new Promise((resolve, reject) => {
@@ -315,5 +251,9 @@ export class AcpClient extends EventEmitter {
 
   get capabilities(): AgentCapabilities {
     return this.agentCapabilities;
+  }
+
+  get providerName(): string {
+    return this.provider.name;
   }
 }

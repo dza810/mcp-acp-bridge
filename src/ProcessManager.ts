@@ -3,9 +3,9 @@ import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 
 export interface ProcessManagerOptions {
-  geminiPath?: string;
-  /** Override the default ["--acp"] args (useful for testing). */
+  command?: string;
   args?: string[];
+  env?: Record<string, string | undefined>;
   maxRestarts?: number;
   restartDelayMs?: number;
 }
@@ -15,15 +15,17 @@ export class ProcessManager extends EventEmitter {
   private restartCount = 0;
   private stopping = false;
 
-  private readonly geminiPath: string;
+  private readonly command: string;
   private readonly spawnArgs: string[];
+  private readonly spawnEnv?: Record<string, string | undefined>;
   private readonly maxRestarts: number;
   private readonly restartDelayMs: number;
 
   constructor(options: ProcessManagerOptions = {}) {
     super();
-    this.geminiPath = options.geminiPath ?? "gemini";
+    this.command = options.command ?? "gemini";
     this.spawnArgs = options.args ?? ["--acp"];
+    this.spawnEnv = options.env;
     this.maxRestarts = options.maxRestarts ?? 5;
     this.restartDelayMs = options.restartDelayMs ?? 1000;
   }
@@ -35,8 +37,9 @@ export class ProcessManager extends EventEmitter {
   }
 
   #spawn(): void {
-    const proc = spawn(this.geminiPath, this.spawnArgs, {
+    const proc = spawn(this.command, this.spawnArgs, {
       stdio: ["pipe", "pipe", "pipe"],
+      env: this.spawnEnv ? { ...process.env, ...this.spawnEnv } : undefined,
     });
 
     this.proc = proc;
@@ -49,7 +52,7 @@ export class ProcessManager extends EventEmitter {
         const msg = JSON.parse(trimmed);
         this.emit("message", msg);
       } catch {
-        // non-JSON output from gemini-cli (startup banners etc.) — ignore
+        // non-JSON output — ignore
       }
     });
 
@@ -67,7 +70,7 @@ export class ProcessManager extends EventEmitter {
         this.emit("restarting", { attempt: this.restartCount, delayMs: delay });
         setTimeout(() => this.#spawn(), delay);
       } else if (!this.stopping) {
-        this.emit("error", new Error(`gemini --acp exited and exceeded max restarts (${this.maxRestarts})`));
+        this.emit("error", new Error(`${this.command} process exited and exceeded max restarts (${this.maxRestarts})`));
       }
     });
 
@@ -77,7 +80,7 @@ export class ProcessManager extends EventEmitter {
   }
 
   write(data: string): void {
-    if (!this.proc?.stdin) throw new Error("gemini process not running");
+    if (!this.proc?.stdin) throw new Error("process not running");
     this.proc.stdin.write(data);
   }
 
